@@ -1,29 +1,29 @@
 #include <windows.h>
 #include <tlhelp32.h>
-#include <d3d11.h>
 #include <tchar.h>
-#include <map>
-#include <set>
-#include <psapi.h>
 #include <string>
-#include <vector>
 #include <random>
 #include <iostream>
-
-
-
-
-
+#include <vector>
 
 void EnableSystemTimePrivilege() {
     HANDLE hToken;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-        TOKEN_PRIVILEGES tp;
+        TOKEN_PRIVILEGES tp = { 0 };
         tp.PrivilegeCount = 1;
-        LookupPrivilegeValue(NULL, SE_SYSTEMTIME_NAME, &tp.Privileges[0].Luid);
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
+        if (LookupPrivilegeValue(NULL, SE_SYSTEMTIME_NAME, &tp.Privileges[0].Luid)) {
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) {
+                std::wcerr << L"AdjustTokenPrivileges failed: " << GetLastError() << std::endl;
+            }
+        }
+        else {
+            std::wcerr << L"LookupPrivilegeValue failed: " << GetLastError() << std::endl;
+        }
         CloseHandle(hToken);
+    }
+    else {
+        std::wcerr << L"OpenProcessToken failed: " << GetLastError() << std::endl;
     }
 }
 
@@ -31,20 +31,61 @@ std::wstring GenerateRandomFileName() {
     const std::wstring chars = L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, chars.length() - 1);
+    std::uniform_int_distribution<> dis(0, static_cast<int>(chars.length()) - 1);
 
     std::wstring filename;
+    filename.reserve(8);
     for (int i = 0; i < 8; ++i) {
         filename += chars[dis(gen)];
     }
-    return filename;
+    return filename + L".tmp";
 }
 
-void CleanUsnJournal() {
+bool ClearEventLogs() {
+    
+    std::vector<std::string> channels = {
+        "Application",
+        "Security",
+        "System",
+        "Setup"
+    };
+
+    bool success = true;
+    for (const auto& channel : channels) {
+        std::string command = "wevtutil cl " + channel;
+        STARTUPINFOA si = { sizeof(si) };
+        PROCESS_INFORMATION pi = { 0 };
+        if (!CreateProcessA(NULL, const_cast<char*>(command.c_str()), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            std::wcerr << L"Failed to clear event log " << std::wstring(channel.begin(), channel.end()) << L": " << GetLastError() << std::endl;
+            success = false;
+            continue;
+        }
+
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD exitCode;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        if (exitCode != 0) {
+            std::wcerr << L"wevtutil command failed for " << std::wstring(channel.begin(), channel.end()) << L" with exit code: " << exitCode << std::endl;
+            success = false;
+        }
+    }
+    return success;
+}
+
+bool CleanUsnJournalAndEventLogs() {
+    
     EnableSystemTimePrivilege();
+
+    
+    SYSTEMTIME originalTime;
+    GetSystemTime(&originalTime);
+
+   
     SYSTEMTIME st;
     GetSystemTime(&st);
-    SYSTEMTIME originalTime = st;
     FILETIME ft;
     SystemTimeToFileTime(&st, &ft);
     ULARGE_INTEGER uli;
@@ -54,39 +95,97 @@ void CleanUsnJournal() {
     ft.dwLowDateTime = uli.LowPart;
     ft.dwHighDateTime = uli.HighPart;
     FileTimeToSystemTime(&ft, &st);
+
+    
     if (!SetSystemTime(&st)) {
-        return;
+        std::wcerr << L"SetSystemTime failed: " << GetLastError() << std::endl;
+        return false;
     }
+
+    
     std::string command = "fsutil usn deletejournal /d /n c:";
     STARTUPINFOA si = { sizeof(si) };
-    PROCESS_INFORMATION pi;
-    if (CreateProcessA(NULL, const_cast<char*>(command.c_str()), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    }
-    else {
+    PROCESS_INFORMATION pi = { 0 };
+    if (!CreateProcessA(NULL, const_cast<char*>(command.c_str()), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        std::wcerr << L"CreateProcess failed: " << GetLastError() << std::endl;
         SetSystemTime(&originalTime);
-        return;
+        return false;
     }
+
+    /
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exitCode != 0) {
+        std::wcerr << L"fsutil command failed with exit code: " << exitCode << std::endl;
+        SetSystemTime(&originalTime);
+        return false;
+    }
+
     wchar_t tempPath[MAX_PATH];
-    GetTempPathW(MAX_PATH, tempPath);
+    if (!GetTempPathW(MAX_PATH, tempPath)) {
+        std::wcerr << L"GetTempPath failed: " << GetLastError() << std::endl;
+        SetSystemTime(&originalTime);
+        return false;
+    }
+
     std::wstring filePath = std::wstring(tempPath) + GenerateRandomFileName();
-    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
         DWORD bytesWritten;
-        WriteFile(hFile, "Dummy data", 10, &bytesWritten, NULL);
+        const char* dummyData = "Dummy data";
+        WriteFile(hFile, dummyData, static_cast<DWORD>(strlen(dummyData)), &bytesWritten, NULL);
+
         FILETIME creationTime, lastWriteTime, lastAccessTime;
         GetFileTime(hFile, &creationTime, &lastAccessTime, &lastWriteTime);
         SYSTEMTIME writeTime;
         FileTimeToSystemTime(&lastWriteTime, &writeTime);
-        char timeBuffer[256];
-        sprintf_s(timeBuffer, "Dummy file write time: %04d-%02d-%02d %02d:%02d:%02d",
-            writeTime.wYear, writeTime.wMonth, writeTime.wDay,
-            writeTime.wHour, writeTime.wMinute, writeTime.wSecond);
+
+        std::wcout << L"Dummy file write time: "
+            << writeTime.wYear << L"-"
+            << writeTime.wMonth << L"-"
+            << writeTime.wDay << L" "
+            << writeTime.wHour << L":"
+            << writeTime.wMinute << L":"
+            << writeTime.wSecond << std::endl;
+
         CloseHandle(hFile);
-        DeleteFileW(filePath.c_str());
+        if (!DeleteFileW(filePath.c_str())) {
+            std::wcerr << L"DeleteFile failed: " << GetLastError() << std::endl;
+        }
     }
+    else {
+        std::wcerr << L"CreateFile failed: " << GetLastError() << std::endl;
+    }
+
+    
     Sleep(1000);
-    SetSystemTime(&originalTime);
+
+   
+    if (!SetSystemTime(&originalTime)) {
+        std::wcerr << L"Restore system time failed: " << GetLastError() << std::endl;
+        return false;
+    }
+
+   
+    if (!ClearEventLogs()) {
+        std::wcerr << L"Event log clearing failed for one or more logs" << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+int wmain() {
+    if (CleanUsnJournalAndEventLogs()) {
+        std::wcout << L"USN Journal and Event Viewer cleaning completed successfully" << std::endl;
+        return 0;
+    }
+    else {
+        std::wcout << L"USN Journal and Event Viewer cleaning failed" << std::endl;
+        return 1;
+    }
 }
